@@ -6,6 +6,7 @@ import json
 import re
 import uuid
 import traceback
+import base64
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from functools import wraps
@@ -33,7 +34,23 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from werkzeug.utils import secure_filename
 from groq import Groq
-import easyocr
+
+# ✅ GOOGLE VISION API
+try:
+    from google.cloud import vision
+    print("✅ Google Vision API imported successfully")
+    GOOGLE_VISION_AVAILABLE = True
+except ImportError:
+    print("⚠️ Google Vision API not available - will use easyocr as fallback")
+    GOOGLE_VISION_AVAILABLE = False
+
+# Fallback to easyocr if Google Vision not available
+if not GOOGLE_VISION_AVAILABLE:
+    try:
+        import easyocr
+        print("✅ EasyOCR available as fallback")
+    except ImportError:
+        print("⚠️ Neither Google Vision nor EasyOCR available")
 
 # ===============================
 # LOAD ENV
@@ -53,6 +70,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 print(f"   JWT_SECRET: {'✅ SET' if JWT_SECRET else '❌ NOT SET'}")
 print(f"   MONGO_URI: {'✅ SET' if MONGO_URI else '❌ NOT SET'}")
 print(f"   GROQ_API_KEY: {GROQ_API_KEY[:20]}..." if GROQ_API_KEY else "   ❌ NOT SET")
+
+if GOOGLE_VISION_AVAILABLE:
+    google_creds = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+    print(f"   GOOGLE_APPLICATION_CREDENTIALS: {'✅ SET' if google_creds else '❌ NOT SET'}")
+else:
+    print(f"   GOOGLE_APPLICATION_CREDENTIALS: ⚠️ Not needed (using fallback)")
+
 print("=" * 50)
 
 if not JWT_SECRET:
@@ -69,15 +93,31 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 print("✅ Groq client initialized")
 
 # ===============================
-# EASYOCR SETUP
+# GOOGLE VISION CLIENT SETUP
 # ===============================
-print("🔄 Initializing EasyOCR (may take 1-2 minutes first time)...")
-try:
-    ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-    print("✅ EasyOCR initialized")
-except Exception as e:
-    print(f"❌ EasyOCR initialization failed: {e}")
-    ocr_reader = None
+vision_client = None
+if GOOGLE_VISION_AVAILABLE:
+    try:
+        vision_client = vision.ImageAnnotatorClient()
+        print("✅ Google Vision API client initialized")
+    except Exception as e:
+        print(f"⚠️ Google Vision client initialization failed: {e}")
+        print("   Will use EasyOCR as fallback")
+        GOOGLE_VISION_AVAILABLE = False
+
+# ===============================
+# EASYOCR SETUP (FALLBACK)
+# ===============================
+ocr_reader = None
+if not GOOGLE_VISION_AVAILABLE:
+    print("🔄 Initializing EasyOCR as fallback (may take 1-2 minutes first time)...")
+    try:
+        import easyocr
+        ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        print("✅ EasyOCR initialized")
+    except Exception as e:
+        print(f"❌ EasyOCR initialization failed: {e}")
+        ocr_reader = None
 
 # ===============================
 # FLASK APP
@@ -206,19 +246,50 @@ def extract_text_from_pdf(file_path):
         return ""
 
 def extract_text_from_image(file_path):
+    """Extract text from image using Google Vision API or EasyOCR"""
+
+    # ✅ Try Google Vision API first
+    if GOOGLE_VISION_AVAILABLE and vision_client:
+        try:
+            print("🔍 Using Google Vision API...")
+            with open(file_path, 'rb') as image_file:
+                content = image_file.read()
+
+            image = vision.Image(content=content)
+            response = vision_client.document_text_detection(image=image)
+
+            if response.full_text_annotation:
+                text = response.full_text_annotation.text
+                print(f"✅ Google Vision extracted {len(text)} chars")
+                return text
+            else:
+                print("⚠️ Google Vision returned no text, trying fallback...")
+                return extract_text_with_easyocr(file_path)
+
+        except Exception as e:
+            print(f"⚠️ Google Vision error: {e}")
+            print("   Falling back to EasyOCR...")
+            return extract_text_with_easyocr(file_path)
+
+    # ✅ Fallback to EasyOCR
+    return extract_text_with_easyocr(file_path)
+
+
+def extract_text_with_easyocr(file_path):
     """Extract text using EasyOCR"""
     if not ocr_reader:
-        raise Exception("OCR not initialized")
+        raise Exception("No OCR service available (Google Vision not configured and EasyOCR not initialized)")
 
     try:
         print("🔍 Using EasyOCR...")
         result = ocr_reader.readtext(file_path, detail=0, paragraph=True)
         text = '\n'.join(result)
-        print(f"✅ Extracted {len(text)} chars")
+        print(f"✅ EasyOCR extracted {len(text)} chars")
         return text
     except Exception as e:
-        print(f"❌ OCR error: {e}")
+        print(f"❌ EasyOCR error: {e}")
         raise
+
 
 def save_uploaded_file(file):
     ext = get_file_extension(file.filename)
@@ -260,7 +331,70 @@ def validate_file_upload(request_obj):
     return file, None
 
 # ===============================
-# SKILL LEARNING RESOURCES
+# ✅ NEW: OCR ENDPOINT
+# ===============================
+@app.route("/ocr", methods=["POST"])
+@require_auth
+def ocr_extract():
+    """Extract text from uploaded image using Google Vision or EasyOCR"""
+    file_path = None
+    try:
+        print("\n" + "="*70)
+        print("📥 OCR REQUEST")
+        print("="*70)
+
+        if "file" not in request.files:
+            return jsonify({"success": False, "error": "No file provided"}), 400
+
+        file = request.files["file"]
+
+        if file.filename == "":
+            return jsonify({"success": False, "error": "No file selected"}), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({
+                "success": False,
+                "error": f"File type not allowed. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            }), 400
+
+        # Save file temporarily
+        file_path = save_uploaded_file(file)
+        print(f"📄 File saved: {file_path}")
+
+        # Extract text
+        text = extract_text_from_image(file_path)
+
+        if not text or len(text.strip()) < 20:
+            return jsonify({
+                "success": False,
+                "error": "Could not extract enough text from image",
+                "text": ""
+            }), 400
+
+        print(f"✅ Extracted {len(text)} characters")
+
+        return jsonify({
+            "success": True,
+            "text": text,
+            "length": len(text),
+            "message": "Text extracted successfully"
+        }), 200
+
+    except Exception as e:
+        print(f"❌ OCR error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "text": ""
+        }), 500
+
+    finally:
+        cleanup_file(file_path)
+
+
+# ===============================
+# SKILL LEARNING RESOURCES (Keep existing)
 # ===============================
 def get_quick_learning_tips(skills):
     """Get quick learning tips for top missing skills"""
@@ -487,11 +621,14 @@ def health_check():
         db_status = "connected"
     except:
         db_status = "disconnected"
+
+    ocr_status = "google_vision" if GOOGLE_VISION_AVAILABLE else ("easyocr" if ocr_reader else "none")
+
     return jsonify({
         "status": "running",
         "database": db_status,
         "ai": "groq",
-        "ocr": "easyocr"
+        "ocr": ocr_status
     })
 
 @app.route("/register", methods=["POST"])
@@ -1563,17 +1700,6 @@ def _get_skill_level(rating):
     else:
         return "Learning 🌱"
 
-
-def safe_parse(val):
-    """Safely parse JSON string or return original value"""
-    if not val:
-        return [] if isinstance(val, str) and val != "{}" else {}
-    if isinstance(val, (list, dict)):
-        return val
-    try:
-        return json.loads(val)
-    except:
-        return [] if "[" in str(val) else {}
 
 # ===============================
 # RUN SERVER
