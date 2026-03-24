@@ -34,3 +34,18 @@ uploads/
 
 # Logs
 *.log
+# Add to .gitignore
+@"
+
+# Google Cloud credentials
+google-vision-key.json
+google-vision-key.json.json
+
+# Environment variables
+.env
+.env.local
+
+# Secrets
+*-key.json
+service-account-key.json
+"@ | Add-Content -Path .gitignore
