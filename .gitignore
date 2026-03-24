@@ -1,21 +1,36 @@
-# Environment
-.env
-
-# Uploads
-uploads/*
-!uploads/.gitkeep
-
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
 venv/
-.venv/
+ENV/
+build/
+dist/
+*.egg-info/
 
-# IDE
+# Environment
+.env
+.env.local
+
+# IDEs
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Uploads
+uploads/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Logs
+*.log

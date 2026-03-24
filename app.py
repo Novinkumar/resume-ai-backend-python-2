@@ -73,12 +73,26 @@ except Exception as e:
 # FLASK APP
 # ===============================
 app = Flask(__name__)
-CORS(app)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB
 
-@app.errorhandler(413)
-def too_large(e):
-    return jsonify({"error": "File too large. Maximum size is 10MB."}), 413
+# 🔥 UPDATED CORS FOR PRODUCTION
+ALLOWED_ORIGINS = [
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+    "http://10.0.2.2:*",
+    "https://your-app-name.onrender.com",  # Replace with actual Render URL
+    "*"  # Allow all for now, restrict later
+]
+
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",  # Change to ALLOWED_ORIGINS after testing
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True
+    }
+})
+
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB
 
 # ===============================
 # UPLOAD CONFIG
@@ -1225,19 +1239,19 @@ def generate_report():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
 
-    # 🔥 Get local IP for mobile testing
-    import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    # 🔥 PRODUCTION CHECK
+    is_production = os.getenv("RENDER") is not None
 
-    print("\n" + "="*60)
-    print("🚀 SERVER STARTED")
-    print("="*60)
-    print(f"📍 Local:    http://localhost:{port}")
-    print(f"📍 Network:  http://{local_ip}:{port}")
-    print(f"📱 Mobile:   http://{local_ip}:{port}")
-    print("="*60)
-    print("\n🔥 Server is running. Use Network URL for mobile testing.\n")
+    if is_production:
+        print("🚀 Running in PRODUCTION mode on Render")
+        print(f"📍 Port: {port}")
+    else:
+        print("🔧 Running in DEVELOPMENT mode")
+        print(f"📍 http://localhost:{port}")
 
-    # ✅ host="0.0.0.0" allows connections from other devices
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # 🔥 Use gunicorn in production, Flask dev server locally
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=not is_production
+    )

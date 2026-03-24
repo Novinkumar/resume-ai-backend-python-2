@@ -1,13 +1,17 @@
-# render.yaml
-
 services:
   - type: web
     name: resume-analyzer-backend
-    runtime: python
-    buildCommand: |
-      pip install -r requirements.txt
-      apt-get update && apt-get install -y tesseract-ocr
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --timeout 300 --workers 2 --threads 4 --bind 0.0.0.0:$PORT"
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.7
+        value: 3.11.0
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGO_URI
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
