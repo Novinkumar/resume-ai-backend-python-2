@@ -4,9 +4,11 @@ print("🔥🔥🔥 RUNNING THIS APP.PY FILE 🔥🔥🔥")
 import os
 import json
 import re
-import base64
+import uuid
+import traceback
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from functools import wraps
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -15,16 +17,13 @@ from pymongo import MongoClient
 import bcrypt
 import jwt
 from PyPDF2 import PdfReader
-import pytesseract
-from PIL import Image
-from openai import OpenAI
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.colors import green, red, black
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer
-)
+from reportlab.lib.colors import green, red
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from werkzeug.utils import secure_filename
+from groq import Groq
+import easyocr
 
 # ===============================
 # LOAD ENV
@@ -32,1272 +31,1213 @@ from werkzeug.utils import secure_filename
 load_dotenv()
 
 # ===============================
-# TESSERACT CONFIG
+# ENVIRONMENT VARIABLES CHECK
 # ===============================
-import platform
+print("=" * 50)
+print("🔑 Environment Variables Check:")
 
-if platform.system() == "Windows":
-    pytesseract.pytesseract.tesseract_cmd = (
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    )
-else:
-    # Linux/Render - tesseract is in PATH
-    pytesseract.pytesseract.tesseract_cmd = "tesseract"
+JWT_SECRET = os.getenv("JWT_SECRET")
+MONGO_URI = os.getenv("MONGO_URI")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+print(f"   JWT_SECRET: {'✅ SET' if JWT_SECRET else '❌ NOT SET'}")
+print(f"   MONGO_URI: {'✅ SET' if MONGO_URI else '❌ NOT SET'}")
+print(f"   GROQ_API_KEY: {GROQ_API_KEY[:20]}..." if GROQ_API_KEY else "   ❌ NOT SET")
+print("=" * 50)
+
+if not JWT_SECRET:
+    raise RuntimeError("❌ JWT_SECRET environment variable is required")
+if not MONGO_URI:
+    raise RuntimeError("❌ MONGO_URI environment variable is required")
+if not GROQ_API_KEY:
+    raise RuntimeError("❌ GROQ_API_KEY environment variable is required")
+
+# ===============================
+# GROQ CLIENT SETUP
+# ===============================
+groq_client = Groq(api_key=GROQ_API_KEY)
+print("✅ Groq client initialized")
+
+# ===============================
+# EASYOCR SETUP
+# ===============================
+print("🔄 Initializing EasyOCR (may take 1-2 minutes first time)...")
+try:
+    ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    print("✅ EasyOCR initialized")
+except Exception as e:
+    print(f"❌ EasyOCR initialization failed: {e}")
+    ocr_reader = None
+
 # ===============================
 # FLASK APP
 # ===============================
 app = Flask(__name__)
 CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({"error": "File too large. Maximum size is 10MB."}), 413
 
 # ===============================
 # UPLOAD CONFIG
 # ===============================
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # ===============================
 # MONGODB
 # ===============================
 try:
-    mongo_client = MongoClient(os.getenv("MONGO_URI"))
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    mongo_client.admin.command("ping")
     db = mongo_client.get_default_database()
     users_collection = db["users"]
+    history_collection = db["history"]
+    learning_progress_collection = db["learning_progress"]
     users_collection.create_index("email", unique=True)
     print("✅ MongoDB connected")
 except Exception as e:
     print(f"❌ MongoDB connection error: {e}")
+    raise SystemExit(1)
 
 # ===============================
-# OPENROUTER CLIENT
+# RESUME KEYWORDS
 # ===============================
-RENDER_URL = os.getenv(
-    "RENDER_EXTERNAL_URL",
-    "http://localhost:3000"
-)
+RESUME_KEYWORDS = [
+    "experience", "education", "skills", "work", "project",
+    "university", "college", "degree", "bachelor", "master",
+    "email", "phone", "linkedin", "github", "portfolio",
+    "developed", "managed", "led", "created", "implemented",
+    "engineer", "developer", "manager", "analyst", "designer",
+    "resume", "cv", "objective", "summary", "certifications",
+]
 
-client = OpenAI(
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://openrouter.ai/api/v1",
-    default_headers={
-        "HTTP-Referer": RENDER_URL,
-        "X-Title": "AI Resume Analyzer",
-    },
-)
+def text_looks_like_resume(text, strict=False):
+    if not text or len(text.strip()) < 100:
+        return False
+    text_lower = text.lower()
+    matches = [kw for kw in RESUME_KEYWORDS if kw in text_lower]
+    count = len(matches)
+    min_required = 5 if strict else 3
+    return count >= min_required
+
+def validate_job_description(job_desc):
+    if not job_desc or len(job_desc.strip()) < 20:
+        return False, ""
+    cleaned = job_desc.strip()
+    job_keywords = ["experience", "required", "responsibilities", "skills", "role", "position"]
+    keyword_matches = sum(1 for kw in job_keywords if kw in cleaned.lower())
+    return keyword_matches >= 2, cleaned
 
 # ===============================
-# HISTORY STORE (IN MEMORY)
+# AUTH MIDDLEWARE
 # ===============================
-history_store = []
-
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not token:
+            return jsonify({"error": "Authentication required"}), 401
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            request.user_id = payload["userId"]
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 # ===============================
 # HELPER FUNCTIONS
 # ===============================
 def safe_parse(val):
-    """Parse JSON string or return list."""
     if not val:
         return []
     if isinstance(val, list):
         return val
     try:
         return json.loads(val)
-    except (json.JSONDecodeError, TypeError):
+    except:
         return []
 
-
 def allowed_file(filename):
-    """Check if file extension is allowed."""
-    ext = os.path.splitext(filename)[1].lower()
-    return ext in ALLOWED_EXTENSIONS
-
+    return os.path.splitext(filename)[1].lower() in ALLOWED_EXTENSIONS
 
 def get_file_extension(filename):
-    """Get lowercase file extension."""
     return os.path.splitext(filename)[1].lower()
 
+def is_image_file(filename):
+    return get_file_extension(filename) in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 def extract_text_from_pdf(file_path):
-    """Extract text from a PDF file."""
-    reader = PdfReader(file_path)
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
-    return text
-
+    try:
+        reader = PdfReader(file_path)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as e:
+        print(f"❌ PDF error: {e}")
+        return ""
 
 def extract_text_from_image(file_path):
-    """Extract text from an image using OCR."""
-    image = Image.open(file_path)
-    text = pytesseract.image_to_string(image, lang="eng")
-    return text
+    """Extract text using EasyOCR"""
+    if not ocr_reader:
+        raise Exception("OCR not initialized")
 
+    try:
+        print("🔍 Using EasyOCR...")
+        result = ocr_reader.readtext(file_path, detail=0, paragraph=True)
+        text = '\n'.join(result)
+        print(f"✅ Extracted {len(text)} chars")
+        return text
+    except Exception as e:
+        print(f"❌ OCR error: {e}")
+        raise
 
 def save_uploaded_file(file):
-    """Save uploaded file and return path."""
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(UPLOAD_DIR, filename)
+    ext = get_file_extension(file.filename)
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
     file.save(file_path)
     return file_path
 
-
 def cleanup_file(file_path):
-    """Remove temporary uploaded file."""
     try:
-        if os.path.exists(file_path):
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
-    except OSError:
+    except:
         pass
 
-
 def extract_json_from_response(raw_text):
-    """Extract JSON object from AI response text."""
-    match = re.search(r'\{[\s\S]*\}', raw_text)
+    """Extract JSON from AI response - handles markdown code blocks"""
+    # Remove markdown code blocks if present
+    cleaned = re.sub(r'```json\s*', '', raw_text)
+    cleaned = re.sub(r'```\s*$', '', cleaned)
+
+    # Try to find JSON object
+    match = re.search(r'\{[\s\S]*\}', cleaned)
     if match:
-        return json.loads(match.group(0))
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON decode error: {e}")
+            print(f"Raw text: {raw_text[:500]}")
+            raise ValueError(f"Invalid JSON in response: {e}")
     raise ValueError("No JSON found in response")
 
-
-def image_to_base64(file_path):
-    """Convert image file to base64 string."""
-    with open(file_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode("utf-8")
-
-
-def get_image_mime_type(filename):
-    """Get MIME type for image."""
-    ext = get_file_extension(filename)
-    mime_types = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
-    return mime_types.get(ext, "image/jpeg")
-
+def validate_file_upload(request_obj):
+    if "resume" not in request_obj.files:
+        return None, (jsonify({"error": "No file uploaded"}), 400)
+    file = request_obj.files["resume"]
+    if not file.filename or not allowed_file(file.filename):
+        return None, (jsonify({"error": "Invalid file type"}), 400)
+    return file, None
 
 # ===============================
-# ROOT TEST
+# SKILL LEARNING RESOURCES
+# ===============================
+def get_quick_learning_tips(skills):
+    """Get quick learning tips for top missing skills"""
+    try:
+        tips_map = {
+            # Programming Languages
+            "python": {"platform": "freeCodeCamp, Codecademy", "time": "2-3 weeks", "type": "Programming Language"},
+            "javascript": {"platform": "JavaScript.info, freeCodeCamp", "time": "2-4 weeks", "type": "Programming Language"},
+            "java": {"platform": "Java Programming MOOC, Codecademy", "time": "4-6 weeks", "type": "Programming Language"},
+            "c++": {"platform": "LearnCpp.com, Udemy", "time": "4-6 weeks", "type": "Programming Language"},
+            "c#": {"platform": "Microsoft Learn, Udemy", "time": "3-4 weeks", "type": "Programming Language"},
+            "typescript": {"platform": "TypeScript Official Docs, Udemy", "time": "1-2 weeks", "type": "Programming Language"},
+            "go": {"platform": "Tour of Go, Udemy", "time": "2-3 weeks", "type": "Programming Language"},
+            "rust": {"platform": "The Rust Book, Rustlings", "time": "4-6 weeks", "type": "Programming Language"},
+            "php": {"platform": "PHP.net tutorial, Laracasts", "time": "2-3 weeks", "type": "Programming Language"},
+            "ruby": {"platform": "Ruby Koans, Codecademy", "time": "3-4 weeks", "type": "Programming Language"},
+            "kotlin": {"platform": "Kotlin Official Docs, Udemy", "time": "2-3 weeks", "type": "Programming Language"},
+
+            # Frontend
+            "react": {"platform": "React.dev official docs, Scrimba", "time": "2-3 weeks", "type": "Frontend Framework"},
+            "vue": {"platform": "Vue Mastery, Vue.js official guide", "time": "2-3 weeks", "type": "Frontend Framework"},
+            "angular": {"platform": "Angular.io official tutorial", "time": "3-4 weeks", "type": "Frontend Framework"},
+            "svelte": {"platform": "Svelte tutorial, YouTube", "time": "1-2 weeks", "type": "Frontend Framework"},
+            "next.js": {"platform": "Next.js official docs, Vercel", "time": "2 weeks", "type": "Frontend Framework"},
+            "html": {"platform": "freeCodeCamp, MDN Web Docs", "time": "1 week", "type": "Frontend"},
+            "css": {"platform": "CSS-Tricks, freeCodeCamp", "time": "2 weeks", "type": "Frontend"},
+            "sass": {"platform": "Sass official guide, Udemy", "time": "1 week", "type": "CSS Framework"},
+            "tailwind": {"platform": "Tailwind official docs, YouTube", "time": "1 week", "type": "CSS Framework"},
+            "bootstrap": {"platform": "Bootstrap official docs, freeCodeCamp", "time": "1 week", "type": "CSS Framework"},
+
+            # Backend
+            "node.js": {"platform": "NodeSchool, freeCodeCamp", "time": "2-3 weeks", "type": "Backend"},
+            "express": {"platform": "Express.js official guide, Udemy", "time": "1-2 weeks", "type": "Backend Framework"},
+            "django": {"platform": "Django official tutorial, Corey Schafer", "time": "3-4 weeks", "type": "Backend Framework"},
+            "flask": {"platform": "Flask Mega-Tutorial, freeCodeCamp", "time": "2 weeks", "type": "Backend Framework"},
+            "spring boot": {"platform": "Spring.io guides, Udemy", "time": "3-4 weeks", "type": "Backend Framework"},
+            "fastapi": {"platform": "FastAPI official docs, YouTube", "time": "1-2 weeks", "type": "Backend Framework"},
+            "laravel": {"platform": "Laracasts, Laravel Bootcamp", "time": "3-4 weeks", "type": "Backend Framework"},
+            "ruby on rails": {"platform": "Rails tutorial, GoRails", "time": "4-6 weeks", "type": "Backend Framework"},
+
+            # Database
+            "sql": {"platform": "SQLBolt, Mode Analytics SQL Tutorial", "time": "2 weeks", "type": "Database"},
+            "mysql": {"platform": "MySQL official tutorial, Udemy", "time": "2 weeks", "type": "Database"},
+            "postgresql": {"platform": "PostgreSQL Tutorial, Udemy", "time": "2 weeks", "type": "Database"},
+            "mongodb": {"platform": "MongoDB University (free), freeCodeCamp", "time": "2 weeks", "type": "Database"},
+            "redis": {"platform": "Redis University (free)", "time": "1 week", "type": "Database"},
+            "dynamodb": {"platform": "AWS DynamoDB Guide, Udemy", "time": "1-2 weeks", "type": "Database"},
+            "cassandra": {"platform": "DataStax Academy (free)", "time": "2-3 weeks", "type": "Database"},
+
+            # DevOps & Cloud
+            "docker": {"platform": "Docker official tutorial, TechWorld with Nana", "time": "1-2 weeks", "type": "DevOps"},
+            "kubernetes": {"platform": "Kubernetes official tutorial, KodeKloud", "time": "3-4 weeks", "type": "DevOps"},
+            "aws": {"platform": "AWS Free Tier, A Cloud Guru", "time": "4-6 weeks", "type": "Cloud"},
+            "azure": {"platform": "Microsoft Learn (free), Udemy", "time": "4-6 weeks", "type": "Cloud"},
+            "gcp": {"platform": "Google Cloud Skills Boost", "time": "4-6 weeks", "type": "Cloud"},
+            "terraform": {"platform": "HashiCorp Learn, Udemy", "time": "2-3 weeks", "type": "DevOps"},
+            "ansible": {"platform": "Ansible official docs, YouTube", "time": "2 weeks", "type": "DevOps"},
+            "jenkins": {"platform": "Jenkins official tutorial, Udemy", "time": "2 weeks", "type": "CI/CD"},
+            "git": {"platform": "Git official tutorial, Oh My Git game", "time": "1 week", "type": "Version Control"},
+            "github": {"platform": "GitHub Skills, freeCodeCamp", "time": "1 week", "type": "Version Control"},
+            "gitlab": {"platform": "GitLab Learn, YouTube", "time": "1 week", "type": "Version Control"},
+            "ci/cd": {"platform": "GitLab CI/CD tutorial, Jenkins tutorial", "time": "2 weeks", "type": "DevOps"},
+
+            # Data Science & ML
+            "machine learning": {"platform": "Coursera Andrew Ng, fast.ai", "time": "8-12 weeks", "type": "AI/ML"},
+            "deep learning": {"platform": "fast.ai, Coursera", "time": "8-12 weeks", "type": "AI/ML"},
+            "data analysis": {"platform": "Kaggle Learn, DataCamp", "time": "4-6 weeks", "type": "Data Science"},
+            "data science": {"platform": "Kaggle, DataCamp", "time": "8-12 weeks", "type": "Data Science"},
+            "pandas": {"platform": "Kaggle, Real Python", "time": "2 weeks", "type": "Data Science"},
+            "numpy": {"platform": "NumPy official tutorial, Real Python", "time": "1 week", "type": "Data Science"},
+            "scikit-learn": {"platform": "Scikit-learn docs, Kaggle", "time": "2-3 weeks", "type": "AI/ML"},
+            "tensorflow": {"platform": "TensorFlow official tutorial", "time": "4-6 weeks", "type": "AI/ML"},
+            "pytorch": {"platform": "PyTorch official tutorial, fast.ai", "time": "4-6 weeks", "type": "AI/ML"},
+            "keras": {"platform": "Keras official guide", "time": "2-3 weeks", "type": "AI/ML"},
+            "nlp": {"platform": "Hugging Face, Coursera", "time": "4-6 weeks", "type": "AI/ML"},
+            "computer vision": {"platform": "OpenCV, PyImageSearch", "time": "4-6 weeks", "type": "AI/ML"},
+
+            # Testing
+            "unit testing": {"platform": "Test Automation University (free)", "time": "2 weeks", "type": "Testing"},
+            "jest": {"platform": "Jest official docs, Udemy", "time": "1 week", "type": "Testing"},
+            "pytest": {"platform": "Real Python, Pytest docs", "time": "1 week", "type": "Testing"},
+            "selenium": {"platform": "Test Automation University, Udemy", "time": "2-3 weeks", "type": "Testing"},
+            "cypress": {"platform": "Cypress official docs, YouTube", "time": "1-2 weeks", "type": "Testing"},
+
+            # Mobile
+            "react native": {"platform": "React Native docs, Udemy", "time": "3-4 weeks", "type": "Mobile"},
+            "flutter": {"platform": "Flutter official docs, Udemy", "time": "3-4 weeks", "type": "Mobile"},
+            "swift": {"platform": "Swift Playgrounds, Hacking with Swift", "time": "4-6 weeks", "type": "Mobile"},
+            "kotlin": {"platform": "Kotlin for Android, Udemy", "time": "3-4 weeks", "type": "Mobile"},
+            "android": {"platform": "Android official codelabs, Udemy", "time": "4-6 weeks", "type": "Mobile"},
+            "ios": {"platform": "Apple Developer, Hacking with Swift", "time": "4-6 weeks", "type": "Mobile"},
+
+            # Other Skills
+            "agile": {"platform": "Scrum.org (free), Coursera", "time": "1-2 weeks", "type": "Methodology"},
+            "scrum": {"platform": "Scrum.org guides (free)", "time": "1 week", "type": "Methodology"},
+            "rest api": {"platform": "freeCodeCamp, Postman Learning", "time": "1-2 weeks", "type": "API"},
+            "graphql": {"platform": "How to GraphQL, Udemy", "time": "2 weeks", "type": "API"},
+            "microservices": {"platform": "Udemy, YouTube", "time": "3-4 weeks", "type": "Architecture"},
+            "system design": {"platform": "System Design Primer, YouTube", "time": "4-8 weeks", "type": "Architecture"},
+            "linux": {"platform": "Linux Journey, Udemy", "time": "3-4 weeks", "type": "OS"},
+            "bash": {"platform": "Bash Scripting Tutorial, Linux Academy", "time": "1-2 weeks", "type": "Scripting"},
+            "powershell": {"platform": "Microsoft Learn, Udemy", "time": "2 weeks", "type": "Scripting"},
+        }
+
+        tips = []
+        for skill in skills[:5]:  # Top 5 skills
+            skill_lower = skill.lower().strip()
+
+            # Try exact match first
+            matched = False
+            for key in tips_map:
+                if key in skill_lower or skill_lower in key:
+                    info = tips_map[key]
+                    tips.append({
+                        "skill": skill,
+                        "type": info["type"],
+                        "quickStart": f"Start with: {info['platform']}",
+                        "estimatedTime": info["time"],
+                        "difficulty": "Beginner to Intermediate",
+                        "isFree": True
+                    })
+                    matched = True
+                    break
+
+            if not matched:
+                # Generic tip for unknown skills
+                tips.append({
+                    "skill": skill,
+                    "type": "General",
+                    "quickStart": "Search on: Udemy, Coursera, YouTube, freeCodeCamp",
+                    "estimatedTime": "2-4 weeks for basics",
+                    "difficulty": "Varies",
+                    "isFree": "Mixed (Free & Paid options available)"
+                })
+
+        return tips
+    except Exception as e:
+        print(f"⚠️ Error in get_quick_learning_tips: {e}")
+        traceback.print_exc()
+        return []
+
+
+def get_detailed_skill_resources(skills):
+    """Get detailed learning resources using AI for top missing skills"""
+    try:
+        if not skills or len(skills) == 0:
+            return []
+
+        # Limit to top 3 to avoid token limits
+        top_skills = skills[:3]
+
+        prompt = f"""Generate learning resources for these skills: {', '.join(top_skills)}
+
+For EACH skill, provide learning path with REAL resources.
+
+Return STRICT JSON (no markdown, just JSON):
+{{
+  "resources": [
+    {{
+      "skill": "skill name",
+      "priority": "High",
+      "estimatedTime": "2 weeks",
+      "freeOptions": [
+        {{
+          "name": "resource name",
+          "type": "Video",
+          "platform": "YouTube",
+          "url": "youtube.com/...",
+          "description": "brief description"
+        }}
+      ],
+      "paidOptions": [
+        {{
+          "name": "resource name",
+          "platform": "Udemy",
+          "price": "$20",
+          "rating": "4.5/5"
+        }}
+      ],
+      "practiceProjects": ["project1", "project2"],
+      "certifications": ["cert1"],
+      "topTips": ["tip1", "tip2", "tip3"]
+    }}
+  ]
+}}"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a career learning advisor. Return ONLY valid JSON without markdown. Recommend real resources."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2500
+        )
+
+        raw_response = completion.choices[0].message.content
+        print(f"🤖 AI Resources Response (first 300 chars): {raw_response[:300]}...")
+
+        parsed = extract_json_from_response(raw_response)
+        resources = parsed.get("resources", [])
+
+        return resources
+
+    except Exception as e:
+        print(f"⚠️ Error in get_detailed_skill_resources: {e}")
+        traceback.print_exc()
+        return []
+
+# ===============================
+# ROUTES
 # ===============================
 @app.route("/", methods=["GET"])
 def root():
     return "Resume Analyzer Backend Running ✅"
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    try:
+        mongo_client.admin.command("ping")
+        db_status = "connected"
+    except:
+        db_status = "disconnected"
+    return jsonify({
+        "status": "running",
+        "database": db_status,
+        "ai": "groq",
+        "ocr": "easyocr"
+    })
 
-# ===============================
-# AUTH ROUTES
-# ===============================
 @app.route("/register", methods=["POST"])
 def register():
     try:
         data = request.get_json()
-        email = data.get("email")
-        password = data.get("password")
+        email = data.get("email", "").strip().lower()
+        password = data.get("password", "")
 
-        if not email or not password:
-            return jsonify({"error": "Email and password required"}), 400
+        if not email or len(password) < 6:
+            return jsonify({"error": "Invalid email or password"}), 400
 
-        existing = users_collection.find_one({"email": email})
-        if existing:
-            return jsonify({"error": "User already exists"}), 400
+        if users_collection.find_one({"email": email}):
+            return jsonify({"error": "User exists"}), 400
 
-        hashed = bcrypt.hashpw(
-            password.encode("utf-8"),
-            bcrypt.gensalt()
-        )
-
+        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
         users_collection.insert_one({
             "email": email,
-            "password": hashed.decode("utf-8"),
+            "password": hashed.decode(),
+            "createdAt": datetime.now(timezone.utc)
         })
-
         return jsonify({"success": True})
-
     except Exception as e:
-        print(f"Register error: {e}")
-        return jsonify({"error": "Register failed"}), 500
-
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/login", methods=["POST"])
 def login():
     try:
         data = request.get_json()
-        email = data.get("email")
-        password = data.get("password")
-
-        if not email or not password:
-            return jsonify({"error": "Email and password required"}), 400
+        email = data.get("email", "").strip().lower()
+        password = data.get("password", "")
 
         user = users_collection.find_one({"email": email})
-        if not user:
+        if not user or not bcrypt.checkpw(password.encode(), user["password"].encode()):
             return jsonify({"error": "Invalid credentials"}), 401
 
-        match = bcrypt.checkpw(
-            password.encode("utf-8"),
-            user["password"].encode("utf-8")
-        )
-
-        if not match:
-            return jsonify({"error": "Invalid credentials"}), 401
-
-        token = jwt.encode(
-            {
-                "userId": str(user["_id"]),
-                "exp": datetime.now(timezone.utc) + timedelta(days=7),
-            },
-            os.getenv("JWT_SECRET"),
-            algorithm="HS256",
-        )
+        token = jwt.encode({
+            "userId": str(user["_id"]),
+            "exp": datetime.now(timezone.utc) + timedelta(days=7)
+        }, JWT_SECRET, algorithm="HS256")
 
         return jsonify({"success": True, "token": token})
-
     except Exception as e:
-        print(f"Login error: {e}")
-        return jsonify({"error": "Login failed"}), 500
+        return jsonify({"error": str(e)}), 500
 
-
-# ===============================
-# ANALYZE
-# ===============================
 @app.route("/analyze", methods=["POST"])
+@require_auth
 def analyze():
     file_path = None
     try:
-        print("📥 Analyze request received")
+        print("\n" + "="*70)
+        print("📥 ANALYZE REQUEST")
+        print("="*70)
+        print(f"User ID: {request.user_id}")
+        print(f"Files received: {request.files}")
+        print(f"Form data: {request.form}")
 
-        job_description = request.form.get("jobDescription", "")
+        file, error = validate_file_upload(request)
+        if error:
+            return error
 
-        if "resume" not in request.files:
-            print("❌ No file in request")
-            return jsonify({"error": "No file uploaded"}), 400
-
-        file = request.files["resume"]
-        print(f"📄 File received: {file.filename}")
-
-        if not file.filename:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        if not allowed_file(file.filename):
-            return jsonify({"error": "Upload PDF or image"}), 400
-
+        job_description = request.form.get("jobDescription", "").strip()
         file_path = save_uploaded_file(file)
-        print(f"💾 File saved to: {file_path}")
 
         ext = get_file_extension(file.filename)
-        is_image = ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        is_image = is_image_file(file.filename)
 
+        print(f"📄 File extension: {ext}")
+        print(f"📄 Is image: {is_image}")
+        print(f"📄 File path: {file_path}")
+
+        # Extract text
         if ext == ".pdf":
+            print("📑 Processing PDF...")
             text = extract_text_from_pdf(file_path)
-            print(f"📝 Extracted text length: {len(text)}")
-
-            if not text.strip():
-                return jsonify({
-                    "error": "Could not extract text from PDF"
-                }), 400
-
-            return analyze_with_text(text, job_description)
-
+            print(f"📑 PDF text length: {len(text)} characters")
+            print(f"📑 First 200 chars: {text[:200] if text else 'EMPTY'}")
         elif is_image:
-            print("🖼️ Image detected - using Vision AI")
-
-            try:
-                text = extract_text_from_image(file_path)
-                print(f"📝 OCR extracted text length: {len(text)}")
-
-                if text.strip() and len(text.strip()) > 100:
-                    print("✅ Using OCR text for analysis")
-                    return analyze_with_text(text, job_description)
-            except Exception as ocr_error:
-                print(f"⚠️ OCR failed: {ocr_error}")
-
-            print("🔍 Using Vision AI to analyze image directly")
-            return analyze_with_vision(file_path, file.filename, job_description)
-
+            print("🖼️ Processing Image...")
+            text = extract_text_from_image(file_path)
+            print(f"🖼️ Image text length: {len(text)} characters")
         else:
-            return jsonify({"error": "Upload PDF or image"}), 400
+            return jsonify({"error": "Invalid file type"}), 400
+
+        # Validate text
+        if not text.strip() or len(text.strip()) < 100:
+            print(f"❌ Not enough text extracted: {len(text.strip())} chars")
+            return jsonify({
+                "error": f"Not enough text extracted ({len(text.strip())} chars). Upload clearer file.",
+                "notResume": True
+            }), 400
+
+        print(f"✅ Text validated: {len(text)} chars")
+        print("✅ Proceeding to analysis...")
+
+        return analyze_with_text(text, job_description)
 
     except Exception as e:
-        import traceback
-        print(f"❌ Analyze error: {e}")
+        print(f"❌ Error: {e}")
         print(traceback.format_exc())
-        return jsonify({"error": f"Failed to analyze resume: {str(e)}"}), 500
-
+        return jsonify({"error": str(e)}), 500
     finally:
-        if file_path:
-            cleanup_file(file_path)
+        cleanup_file(file_path)
 
 
 def analyze_with_text(text, job_description):
-    """Analyze resume using extracted text."""
-    print("🤖 Calling AI with text...")
+    """Analyze resume text and return results with learning resources"""
+    has_valid_job, cleaned_job = validate_job_description(job_description)
 
-    prompt = f"""
-You are an advanced ATS resume analyzer and AI-detection system.
+    if not has_valid_job:
+        prompt = f"""Analyze this resume (no job description provided).
 
-Resume Text:
-{text[:4000]}
+Resume: {text[:4000]}
 
-Job Description:
-{job_description}
-
-Analyze this resume and return STRICT JSON:
-
+Return STRICT JSON (no markdown):
 {{
-  "atsScore": number (0-100),
-  "fitScore": number (0-100),
-  "skillStrength": {{"skill_name": number (1-5)}},
-  "matchingSkills": ["skill1", "skill2"],
-  "missingSkills": ["skill1", "skill2"],
-  "aiDetection": {{
-    "aiProbability": number (0-100),
-    "riskLevel": "Low" | "Medium" | "High",
-    "flaggedSections": [],
-    "reasons": []
-  }}
-}}
-"""
+  "atsScore": 75,
+  "fitScore": 0,
+  "skillStrength": {{}},
+  "matchingSkills": [],
+  "missingSkills": [],
+  "aiDetection": {{"aiProbability": 0, "riskLevel": "Low", "flaggedSections": [], "reasons": [], "suggestions": []}},
+  "overallFeedback": "2-3 sentences"
+}}"""
+    else:
+        prompt = f"""Analyze resume vs job description.
 
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
+Resume: {text[:4000]}
+
+Job: {cleaned_job}
+
+Return STRICT JSON (no markdown):
+{{
+  "atsScore": 75,
+  "fitScore": 68,
+  "skillStrength": {{"Python": 8, "SQL": 7}},
+  "matchingSkills": ["Python", "SQL"],
+  "missingSkills": ["Docker", "AWS"],
+  "aiDetection": {{"aiProbability": 15, "riskLevel": "Low", "flaggedSections": [], "reasons": [], "suggestions": []}},
+  "overallFeedback": "2-3 sentences"
+}}"""
+
+    completion = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         temperature=0.2,
         messages=[
-            {"role": "system", "content": "You are an ATS resume analyzer. Return only valid JSON."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": "Return only valid JSON without markdown code blocks"},
+            {"role": "user", "content": prompt}
         ],
+        max_tokens=2000
     )
 
-    raw = completion.choices[0].message.content
-    print(f"🤖 AI Response: {raw[:500]}")
+    parsed = extract_json_from_response(completion.choices[0].message.content)
 
-    parsed = extract_json_from_response(raw)
-    print("✅ Parsed successfully")
+    if not has_valid_job:
+        parsed["fitScore"] = 0
+        parsed["matchingSkills"] = []
+        parsed["missingSkills"] = []
+
+    # ✅ Add learning resources for missing skills
+    missing_skills = parsed.get("missingSkills", [])
+    if missing_skills and len(missing_skills) > 0:
+        print(f"🎓 Generating learning resources for {len(missing_skills)} missing skills...")
+
+        try:
+            # Get quick learning tips (fast, from database)
+            parsed["skillResourcesAvailable"] = True
+            quick_tips = get_quick_learning_tips(missing_skills[:5])
+            if quick_tips:
+                parsed["quickLearningTips"] = quick_tips
+                print(f"✅ Added {len(quick_tips)} quick learning tips")
+
+            # Get detailed resources for top 3 skills (AI-powered)
+            detailed_resources = get_detailed_skill_resources(missing_skills[:3])
+            if detailed_resources:
+                parsed["learningResources"] = detailed_resources
+                print(f"✅ Added detailed learning resources for {len(detailed_resources)} skills")
+            else:
+                print("⚠️ No detailed resources generated")
+
+        except Exception as e:
+            print(f"⚠️ Could not generate learning resources: {e}")
+            traceback.print_exc()
+            # Don't fail the entire request if resource generation fails
+            parsed["skillResourcesAvailable"] = False
+    else:
+        print("ℹ️ No missing skills found, skipping resource generation")
 
     return jsonify({"success": True, **parsed})
 
 
-def analyze_with_vision(file_path, filename, job_description):
-    """Analyze resume image using Vision AI."""
-    print("🔍 Converting image to base64...")
-
-    base64_image = image_to_base64(file_path)
-    mime_type = get_image_mime_type(filename)
-
-    print(f"📊 Image base64 length: {len(base64_image)} chars")
-
-    prompt = f"""
-You are an advanced ATS resume analyzer with vision capabilities.
-
-Look at this resume image and analyze it thoroughly.
-
-Job Description:
-{job_description if job_description else "General software developer position"}
-
-Analyze the resume in the image and extract:
-1. All skills mentioned
-2. Work experience
-3. Education
-4. Projects
-5. Overall quality
-
-Then return STRICT JSON format:
-
-{{
-  "atsScore": number (0-100, based on resume quality, formatting, keywords),
-  "fitScore": number (0-100, how well it matches the job description),
-  "skillStrength": {{"skill_name": number (1-5)}},
-  "matchingSkills": ["skill1", "skill2", "skill3"],
-  "missingSkills": ["skill1", "skill2"],
-  "aiDetection": {{
-    "aiProbability": number (0-100),
-    "riskLevel": "Low" | "Medium" | "High",
-    "flaggedSections": [],
-    "reasons": []
-  }}
-}}
-
-Return ONLY the JSON, no other text.
-"""
-
-    print("🤖 Calling Vision AI...")
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
-        ],
-        max_tokens=2000,
-    )
-
-    raw = completion.choices[0].message.content
-    print(f"🤖 Vision AI Response: {raw[:500]}")
-
-    parsed = extract_json_from_response(raw)
-    print("✅ Vision analysis parsed successfully")
-
-    return jsonify({"success": True, **parsed})
-
-
-# ===============================
-# RESUME OPTIMIZER
-# ===============================
 @app.route("/optimize-resume", methods=["POST"])
+@require_auth
 def optimize_resume():
     file_path = None
     try:
-        job_description = request.form.get("jobDescription", "")
+        file, error = validate_file_upload(request)
+        if error:
+            return error
 
-        if "resume" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
+        job_desc = request.form.get("jobDescription", "").strip()
+        has_valid, cleaned = validate_job_description(job_desc)
 
-        file = request.files["resume"]
-
-        if not file.filename:
-            return jsonify({"error": "No file uploaded"}), 400
+        if not has_valid:
+            return jsonify({"error": "Provide valid job description", "needsJobDescription": True}), 400
 
         file_path = save_uploaded_file(file)
         ext = get_file_extension(file.filename)
-        is_image = ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
-        if ext == ".pdf":
-            text = extract_text_from_pdf(file_path)
-            return optimize_with_text(text, job_description)
-        elif is_image:
-            try:
-                text = extract_text_from_image(file_path)
-                if text.strip() and len(text.strip()) > 100:
-                    return optimize_with_text(text, job_description)
-            except:
-                pass
-            return optimize_with_vision(file_path, file.filename, job_description)
-        else:
-            return jsonify({"error": "Upload PDF or image"}), 400
+        text = extract_text_from_pdf(file_path) if ext == ".pdf" else extract_text_from_image(file_path)
 
+        if not text.strip() or not text_looks_like_resume(text, strict=True):
+            return jsonify({"error": "Invalid resume", "notResume": True}), 400
+
+        prompt = f"""Optimize resume for job.
+
+Resume: {text[:3500]}
+Job: {cleaned}
+
+Return JSON (no markdown):
+{{
+  "optimizedSummary": "improved summary",
+  "rewrittenExperience": ["bullet1", "bullet2"],
+  "addedKeywords": ["kw1", "kw2"]
+}}"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": "Return only JSON without markdown"},
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        parsed = extract_json_from_response(completion.choices[0].message.content)
+        return jsonify({"success": True, **parsed})
     except Exception as e:
-        print(f"Optimize resume error: {e}")
-        return jsonify({"error": "Failed to optimize resume"}), 500
-
+        print(f"❌ Optimize resume error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
     finally:
-        if file_path:
-            cleanup_file(file_path)
+        cleanup_file(file_path)
 
-
-def optimize_with_text(text, job_description):
-    """Optimize resume using text."""
-    prompt = f"""
-You are a professional resume writer.
-
-Rewrite this resume to better match the job description.
-
-Rules:
-- Do NOT invent experience
-- Improve wording
-- Add missing keywords naturally
-- ATS optimized
-- Keep concise
-
-Return STRICT JSON:
-
-{{
-  "optimizedSummary": "",
-  "rewrittenExperience": [],
-  "addedKeywords": []
-}}
-
-Resume:
-{text[:3500]}
-
-Job Description:
-{job_description}
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.3,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    raw = completion.choices[0].message.content
-    parsed = extract_json_from_response(raw)
-
-    return jsonify({"success": True, **parsed})
-
-
-def optimize_with_vision(file_path, filename, job_description):
-    """Optimize resume using vision."""
-    base64_image = image_to_base64(file_path)
-    mime_type = get_image_mime_type(filename)
-
-    prompt = f"""
-You are a professional resume writer with vision capabilities.
-
-Look at this resume image and rewrite it to better match the job description.
-
-Job Description:
-{job_description if job_description else "General software developer position"}
-
-Rules:
-- Do NOT invent experience
-- Improve wording based on what you see
-- Suggest missing keywords
-- ATS optimized suggestions
-
-Return STRICT JSON:
-
-{{
-  "optimizedSummary": "A better professional summary based on what you see",
-  "rewrittenExperience": ["improved bullet point 1", "improved bullet point 2"],
-  "addedKeywords": ["keyword1", "keyword2"]
-}}
-
-Return ONLY the JSON.
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.3,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
-        ],
-        max_tokens=2000,
-    )
-
-    raw = completion.choices[0].message.content
-    parsed = extract_json_from_response(raw)
-
-    return jsonify({"success": True, **parsed})
-
-
-# ===============================
-# INTERVIEW
-# ===============================
 @app.route("/interview", methods=["POST"])
+@require_auth
 def interview():
     file_path = None
     try:
-        job_description = request.form.get("jobDescription", "")
-
-        if "resume" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        file = request.files["resume"]
-
-        if not file.filename:
-            return jsonify({"error": "No file uploaded"}), 400
+        file, error = validate_file_upload(request)
+        if error:
+            return error
 
         file_path = save_uploaded_file(file)
         ext = get_file_extension(file.filename)
-        is_image = ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        text = extract_text_from_pdf(file_path) if ext == ".pdf" else extract_text_from_image(file_path)
 
-        if ext == ".pdf":
-            text = extract_text_from_pdf(file_path)
-            return interview_with_text(text, job_description)
-        elif is_image:
-            try:
-                text = extract_text_from_image(file_path)
-                if text.strip() and len(text.strip()) > 100:
-                    return interview_with_text(text, job_description)
-            except:
-                pass
-            return interview_with_vision(file_path, file.filename, job_description)
-        else:
-            return jsonify({"error": "Upload PDF or image"}), 400
+        if not text.strip() or not text_looks_like_resume(text):
+            return jsonify({"error": "Invalid resume", "notResume": True}), 400
+
+        job_desc = request.form.get("jobDescription", "general role")
+
+        prompt = f"""Generate interview prep based on resume and job.
+
+Resume: {text[:3000]}
+Job: {job_desc}
+
+Format as text (not JSON):
+TECHNICAL QUESTIONS: (5 items)
+BEHAVIORAL QUESTIONS: (5 items)
+SYSTEM DESIGN: (3 items)
+CODING TOPICS: (5 items)"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return jsonify({"success": True, "interviewPrep": completion.choices[0].message.content})
+    except Exception as e:
+        print(f"❌ Interview prep error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cleanup_file(file_path)
+
+@app.route("/generate-cover-letter", methods=["POST"])
+@require_auth
+def generate_cover_letter():
+    file_path = None
+    try:
+        file, error = validate_file_upload(request)
+        if error:
+            return error
+
+        job_desc = request.form.get("jobDescription", "").strip()
+        has_valid, cleaned = validate_job_description(job_desc)
+
+        if not has_valid:
+            return jsonify({"error": "Provide valid job description", "needsJobDescription": True}), 400
+
+        file_path = save_uploaded_file(file)
+        ext = get_file_extension(file.filename)
+        text = extract_text_from_pdf(file_path) if ext == ".pdf" else extract_text_from_image(file_path)
+
+        if not text.strip() or not text_looks_like_resume(text):
+            return jsonify({"error": "Invalid resume", "notResume": True}), 400
+
+        company = request.form.get("companyName", "the company")
+        manager = request.form.get("hiringManager", "Hiring Manager")
+
+        prompt = f"""Write professional cover letter.
+
+Resume: {text[:3500]}
+Job: {cleaned}
+Company: {company}
+Manager: {manager}
+
+Start with "Dear {manager},"
+End with "Sincerely,"
+3-4 paragraphs, warm tone."""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.5,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1500
+        )
+
+        return jsonify({"success": True, "coverLetter": completion.choices[0].message.content})
+    except Exception as e:
+        print(f"❌ Cover letter error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cleanup_file(file_path)
+
+@app.route("/optimize-linkedin", methods=["POST"])
+@require_auth
+def optimize_linkedin():
+    file_path = None
+    try:
+        file, error = validate_file_upload(request)
+        if error:
+            return error
+
+        file_path = save_uploaded_file(file)
+        ext = get_file_extension(file.filename)
+        text = extract_text_from_pdf(file_path) if ext == ".pdf" else extract_text_from_image(file_path)
+
+        if not text.strip() or not text_looks_like_resume(text):
+            return jsonify({"error": "Invalid resume", "notResume": True}), 400
+
+        target = request.form.get("targetRole") or request.form.get("jobDescription") or "general professional"
+
+        prompt = f"""Generate LinkedIn content.
+
+Resume: {text[:3500]}
+Target: {target}
+
+Return JSON (no markdown):
+{{
+  "headline": "220 chars max",
+  "about": "summary with keywords",
+  "experienceBullets": [{{"company": "", "role": "", "bullets": []}}],
+  "featuredSkills": ["skill1"],
+  "keywords": ["kw1"],
+  "profileTips": ["tip1"]
+}}"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": "Return only JSON without markdown"},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2500
+        )
+
+        parsed = extract_json_from_response(completion.choices[0].message.content)
+        return jsonify({"success": True, **parsed})
+    except Exception as e:
+        print(f"❌ LinkedIn optimization error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cleanup_file(file_path)
+
+@app.route("/get-skill-resources", methods=["POST"])
+@require_auth
+def get_skill_resources():
+    """Get comprehensive learning resources for missing skills"""
+    try:
+        data = request.get_json()
+        missing_skills = data.get("missingSkills", [])
+        skill_level = data.get("skillLevel", "beginner")
+
+        if not missing_skills:
+            return jsonify({"success": True, "resources": []})
+
+        print(f"🔍 Finding resources for {len(missing_skills)} skills at {skill_level} level...")
+
+        # Limit to top 5 skills to avoid token limits
+        top_skills = missing_skills[:5]
+
+        prompt = f"""Generate comprehensive learning resources for a {skill_level} learner.
+
+Skills: {', '.join(top_skills)}
+
+Return STRICT JSON (no markdown):
+{{
+  "resources": [
+    {{
+      "skill": "skill name",
+      "priority": "High",
+      "difficulty": "Beginner",
+      "estimatedTime": "2-3 weeks",
+      "learningPath": {{
+        "youtube": [
+          {{"channel": "name", "title": "course", "url": "link", "duration": "20 hours", "subscribers": "1M", "isFree": true}}
+        ],
+        "courses": [
+          {{"platform": "Udemy", "title": "Complete Guide", "instructor": "John Doe", "url": "link", "price": "$20", "rating": "4.5/5", "duration": "40 hours", "certificate": true, "isFree": false}}
+        ],
+        "practice": [
+          {{"platform": "LeetCode", "type": "Coding Challenges", "url": "link", "description": "Practice problems", "isFree": true}}
+        ],
+        "certifications": [
+          {{"name": "Cert Name", "provider": "Provider", "cost": "$100", "duration": "2 months", "industry_value": "High"}}
+        ],
+        "books": [
+          {{"title": "Book Title", "author": "Author", "type": "Free PDF", "url": "link"}}
+        ]
+      }},
+      "projectIdeas": [
+        {{"title": "Build a calculator", "description": "Create basic calculator", "difficulty": "Easy", "estimatedTime": "3 days", "technologies": ["HTML", "CSS", "JS"]}}
+      ],
+      "studyPlan": {{
+        "week1": "Learn basics",
+        "week2": "Practice fundamentals",
+        "week3": "Build projects",
+        "week4": "Advanced concepts"
+      }},
+      "tips": ["Start with fundamentals", "Practice daily", "Build projects"],
+      "relatedSkills": ["skill1", "skill2"]
+    }}
+  ],
+  "overallRecommendations": {{
+    "priorityOrder": ["skill1", "skill2"],
+    "totalEstimatedTime": "3 months",
+    "budgetFriendly": true,
+    "learningStrategy": "Focus on one skill at a time"
+  }}
+}}"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert career advisor. Return ONLY valid JSON without markdown. Recommend real, verified resources."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=4000
+        )
+
+        raw = completion.choices[0].message.content
+        print(f"🤖 Resources response (first 300 chars): {raw[:300]}...")
+
+        parsed = extract_json_from_response(raw)
+        resources = parsed.get("resources", [])
+
+        print(f"✅ Found resources for {len(resources)} skills")
+
+        result = {
+            "success": True,
+            "resources": resources,
+            "overallRecommendations": parsed.get("overallRecommendations", {}),
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "skillCount": len(resources)
+        }
+
+        return jsonify(result)
 
     except Exception as e:
-        print(f"Interview error: {e}")
-        return jsonify({"error": "Failed to generate interview prep"}), 500
-
-    finally:
-        if file_path:
-            cleanup_file(file_path)
+        print(f"❌ Error getting resources: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
-def interview_with_text(text, job_description):
-    """Generate interview prep from text."""
-    prompt = f"""
-You are an interview coach.
+@app.route("/get-skill-roadmap", methods=["POST"])
+@require_auth
+def get_skill_roadmap():
+    """Generate a detailed learning roadmap for a specific skill"""
+    try:
+        data = request.get_json()
+        skill = data.get("skill", "").strip()
+        current_level = data.get("currentLevel", "beginner")
+        target_level = data.get("targetLevel", "professional")
+        weekly_hours = data.get("weeklyHours", 10)
 
-Resume:
-{text[:3000]}
+        if not skill:
+            return jsonify({"error": "Skill name required"}), 400
 
-Job Description:
-{job_description}
+        prompt = f"""Create detailed learning roadmap for: {skill}
 
-Generate interview preparation in CLEAN TEXT FORMAT.
+Current: {current_level}
+Target: {target_level}
+Time: {weekly_hours} hours/week
 
-Include:
+Return JSON (no markdown):
+{{
+  "skill": "{skill}",
+  "totalDuration": "3 months",
+  "phases": [
+    {{
+      "phase": 1,
+      "title": "Foundation",
+      "duration": "4 weeks",
+      "goals": ["goal1", "goal2"],
+      "topics": [
+        {{"name": "topic", "hours": 10, "resources": ["res1"], "milestones": ["checkpoint1"]}}
+      ],
+      "projects": [
+        {{"name": "project", "description": "desc", "skills_practiced": ["skill1"]}}
+      ]
+    }}
+  ],
+  "milestones": [
+    {{"week": 1, "checkpoint": "what you should know", "assessment": "how to test"}}
+  ],
+  "dailySchedule": {{
+    "weekday": "1 hour practice",
+    "weekend": "3 hours projects"
+  }},
+  "resources": {{
+    "essential": ["must-have"],
+    "supplementary": ["nice-to-have"]
+  }},
+  "successMetrics": ["metric1"]
+}}"""
 
-TECHNICAL QUESTIONS:
-- 5 items
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": "Create actionable roadmaps. Return only JSON without markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=3000
+        )
 
-BEHAVIORAL QUESTIONS:
-- 5 items
+        parsed = extract_json_from_response(completion.choices[0].message.content)
+        return jsonify({"success": True, **parsed})
 
-SYSTEM DESIGN PROMPTS:
-- 3 items
-
-CODING TOPICS:
-- 5 items
-
-Rules:
-- NO JSON
-- Use headings and bullet points only
-- Human readable
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.3,
-        messages=[
-            {"role": "system", "content": "Interview coach"},
-            {"role": "user", "content": prompt},
-        ],
-    )
-
-    return jsonify({
-        "success": True,
-        "interviewPrep": completion.choices[0].message.content,
-    })
+    except Exception as e:
+        print(f"❌ Error generating roadmap: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
-def interview_with_vision(file_path, filename, job_description):
-    """Generate interview prep from image."""
-    base64_image = image_to_base64(file_path)
-    mime_type = get_image_mime_type(filename)
+@app.route("/track-learning-progress", methods=["POST"])
+@require_auth
+def track_learning_progress():
+    """Track user's learning progress for skills"""
+    try:
+        data = request.get_json()
+        skill = data.get("skill")
+        progress = data.get("progress", 0)  # 0-100
+        completed_resources = data.get("completedResources", [])
+        notes = data.get("notes", "")
 
-    prompt = f"""
-You are an interview coach with vision capabilities.
+        if not skill:
+            return jsonify({"error": "Skill name required"}), 400
 
-Look at this resume image and generate interview preparation.
-
-Job Description:
-{job_description if job_description else "General software developer position"}
-
-Based on what you see in the resume, generate:
-
-TECHNICAL QUESTIONS:
-- 5 relevant questions based on their skills
-
-BEHAVIORAL QUESTIONS:
-- 5 questions based on their experience
-
-SYSTEM DESIGN PROMPTS:
-- 3 items relevant to their level
-
-CODING TOPICS:
-- 5 topics they should prepare
-
-Rules:
-- NO JSON
-- Use headings and bullet points only
-- Human readable format
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.3,
-        messages=[
+        learning_progress_collection.update_one(
             {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}",
-                            "detail": "high",
-                        },
-                    },
-                ],
+                "userId": request.user_id,
+                "skill": skill
             },
-        ],
-        max_tokens=2000,
-    )
+            {
+                "$set": {
+                    "progress": progress,
+                    "completedResources": completed_resources,
+                    "notes": notes,
+                    "lastUpdated": datetime.now(timezone.utc)
+                },
+                "$setOnInsert": {
+                    "startedAt": datetime.now(timezone.utc)
+                }
+            },
+            upsert=True
+        )
 
-    return jsonify({
-        "success": True,
-        "interviewPrep": completion.choices[0].message.content,
-    })
+        return jsonify({"success": True, "message": "Progress updated"})
+
+    except Exception as e:
+        print(f"❌ Track progress error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
-# ===============================
-# HISTORY
-# ===============================
+@app.route("/get-learning-progress", methods=["GET"])
+@require_auth
+def get_learning_progress():
+    """Get user's learning progress"""
+    try:
+        progress = list(learning_progress_collection.find(
+            {"userId": request.user_id},
+            {"_id": 0, "userId": 0}
+        ).sort("lastUpdated", -1))
+
+        for p in progress:
+            if "startedAt" in p:
+                p["startedAt"] = p["startedAt"].isoformat()
+            if "lastUpdated" in p:
+                p["lastUpdated"] = p["lastUpdated"].isoformat()
+
+        return jsonify({"success": True, "progress": progress})
+
+    except Exception as e:
+        print(f"❌ Get progress error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/get-trending-skills", methods=["GET"])
+@require_auth
+def get_trending_skills():
+    """Get trending skills in the industry"""
+    try:
+        industry = request.args.get("industry", "technology")
+
+        prompt = f"""List top 20 trending skills for {industry} industry in 2024.
+
+Return JSON (no markdown):
+{{
+  "trending": [
+    {{
+      "skill": "Python",
+      "category": "Programming",
+      "demandLevel": "Very High",
+      "averageSalary": "$110,000",
+      "growthRate": "25%",
+      "jobOpenings": "50,000+",
+      "difficulty": "Intermediate",
+      "learningTime": "3-4 months",
+      "relatedRoles": ["Developer", "Data Scientist"],
+      "why_trending": "AI boom"
+    }}
+  ],
+  "emergingSkills": ["AI", "Web3"],
+  "decliningSkills": ["jQuery", "Flash"]
+}}"""
+
+        completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": "Provide current job market data. Return only JSON without markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2500
+        )
+
+        parsed = extract_json_from_response(completion.choices[0].message.content)
+        return jsonify({"success": True, **parsed})
+
+    except Exception as e:
+        print(f"❌ Error getting trending skills: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/save-history", methods=["POST"])
+@require_auth
 def save_history():
-    data = request.get_json()
-
-    record = {
-        "score": data.get("score"),
-        "skills": data.get("skills", []),
-        "createdAt": datetime.now(timezone.utc).isoformat(),
-    }
-
-    history_store.insert(0, record)
-
-    return jsonify({"success": True})
-
+    try:
+        data = request.get_json()
+        history_collection.insert_one({
+            "userId": request.user_id,
+            **data,
+            "createdAt": datetime.now(timezone.utc)
+        })
+        return jsonify({"success": True})
+    except Exception as e:
+        print(f"❌ Save history error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Failed"}), 500
 
 @app.route("/history", methods=["GET"])
+@require_auth
 def get_history():
-    return jsonify(history_store)
+    try:
+        records = list(history_collection.find(
+            {"userId": request.user_id},
+            {"_id": 0, "userId": 0}
+        ).sort("createdAt", -1).limit(50))
 
+        for r in records:
+            if "createdAt" in r:
+                r["createdAt"] = r["createdAt"].isoformat()
+        return jsonify(records)
+    except Exception as e:
+        print(f"❌ Get history error: {e}")
+        traceback.print_exc()
+        return jsonify([])
 
-# ===============================
-# GENERATE PDF REPORT
-# ===============================
+@app.route("/history/clear", methods=["DELETE"])
+@require_auth
+def clear_history():
+    try:
+        result = history_collection.delete_many({"userId": request.user_id})
+        return jsonify({"success": True, "deleted": result.deleted_count})
+    except Exception as e:
+        print(f"❌ Clear history error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Failed"}), 500
+
 @app.route("/generate-report", methods=["POST"])
+@require_auth
 def generate_report():
     try:
         score = request.form.get("score", "N/A")
         fit_score = request.form.get("fitScore", "N/A")
         skills = safe_parse(request.form.get("skills"))
-        matching_skills = safe_parse(request.form.get("matchingSkills"))
-        missing_skills = safe_parse(request.form.get("missingSkills"))
-        interview_prep = request.form.get("interviewPrep", "")
+        matching = safe_parse(request.form.get("matchingSkills"))
+        missing = safe_parse(request.form.get("missingSkills"))
 
         buffer = BytesIO()
-
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=letter,
-            leftMargin=40,
-            rightMargin=40,
-            topMargin=40,
-            bottomMargin=40,
-        )
-
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
         styles = getSampleStyleSheet()
-
-        title_style = ParagraphStyle(
-            "CustomTitle",
-            parent=styles["Title"],
-            fontSize=24,
-            alignment=1,
-        )
-
-        heading_style = ParagraphStyle(
-            "CustomHeading",
-            parent=styles["Heading2"],
-            fontSize=18,
-        )
-
-        normal_style = styles["Normal"]
-
-        green_style = ParagraphStyle(
-            "GreenText",
-            parent=styles["Normal"],
-            textColor=green,
-        )
-
-        red_style = ParagraphStyle(
-            "RedText",
-            parent=styles["Normal"],
-            textColor=red,
-        )
-
         elements = []
 
-        elements.append(Paragraph("AI Resume Analysis Report", title_style))
+        elements.append(Paragraph("Resume Analysis Report", styles['Title']))
         elements.append(Spacer(1, 12))
-
-        elements.append(
-            Paragraph(
-                f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                normal_style,
-            )
-        )
-        elements.append(Spacer(1, 24))
-
-        elements.append(Paragraph("Summary Scores", heading_style))
-        elements.append(Spacer(1, 8))
-        elements.append(Paragraph(f"ATS Score: {score}%", normal_style))
-        elements.append(Paragraph(f"Fit Score: {fit_score}%", normal_style))
-        elements.append(Spacer(1, 24))
-
-        elements.append(Paragraph("Skills Found", heading_style))
-        elements.append(Spacer(1, 8))
-        for s in skills:
-            elements.append(Paragraph(f"• {s}", normal_style))
-        elements.append(Spacer(1, 16))
-
-        elements.append(Paragraph("Matching Skills", heading_style))
-        elements.append(Spacer(1, 8))
-        for s in matching_skills:
-            elements.append(Paragraph(f"✔ {s}", green_style))
-        elements.append(Spacer(1, 16))
-
-        elements.append(Paragraph("Missing Skills", heading_style))
-        elements.append(Spacer(1, 8))
-        for s in missing_skills:
-            elements.append(Paragraph(f"✖ {s}", red_style))
-        elements.append(Spacer(1, 16))
-
-        if interview_prep:
-            elements.append(Paragraph("Interview Preparation", heading_style))
-            elements.append(Spacer(1, 8))
-            for line in interview_prep.split("\n"):
-                if line.strip():
-                    elements.append(Paragraph(line, normal_style))
-                    elements.append(Spacer(1, 4))
+        elements.append(Paragraph(f"ATS Score: {score}%", styles['Normal']))
+        elements.append(Paragraph(f"Fit Score: {fit_score}%", styles['Normal']))
 
         doc.build(elements)
         buffer.seek(0)
 
-        return send_file(
-            buffer,
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name="resume_report.pdf",
-        )
-
+        return send_file(buffer, mimetype="application/pdf", as_attachment=True, download_name="report.pdf")
     except Exception as e:
-        print(f"PDF ERROR: {e}")
-        return jsonify({"error": "Failed to generate PDF"}), 500
+        print(f"❌ Generate report error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Failed"}), 500
 
 # ===============================
-# COVER LETTER GENERATOR
-# ===============================
-@app.route("/generate-cover-letter", methods=["POST"])
-def generate_cover_letter():
-    file_path = None
-    try:
-        print("📧 Cover letter request received")
-
-        job_description = request.form.get("jobDescription", "")
-        company_name = request.form.get("companyName", "the company")
-        hiring_manager = request.form.get("hiringManager", "Hiring Manager")
-
-        if "resume" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        file = request.files["resume"]
-        file_path = save_uploaded_file(file)
-
-        ext = get_file_extension(file.filename)
-        is_image = ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-
-        # Get resume content
-        if ext == ".pdf":
-            text = extract_text_from_pdf(file_path)
-            if text.strip():
-                return generate_cover_letter_text(
-                    text, job_description, company_name, hiring_manager
-                )
-
-        if is_image or not text.strip():
-            # Try OCR first
-            try:
-                text = extract_text_from_image(file_path)
-                if text.strip() and len(text.strip()) > 100:
-                    return generate_cover_letter_text(
-                        text, job_description, company_name, hiring_manager
-                    )
-            except:
-                pass
-
-            # Use vision
-            return generate_cover_letter_vision(
-                file_path, file.filename, job_description, company_name, hiring_manager
-            )
-
-        return generate_cover_letter_text(
-            text, job_description, company_name, hiring_manager
-        )
-
-    except Exception as e:
-        import traceback
-        print(f"❌ Cover letter error: {e}")
-        print(traceback.format_exc())
-        return jsonify({"error": "Failed to generate cover letter"}), 500
-
-    finally:
-        if file_path:
-            cleanup_file(file_path)
-
-
-def generate_cover_letter_text(text, job_description, company_name, hiring_manager):
-    """Generate cover letter from resume text."""
-    print("📝 Generating cover letter from text...")
-
-    prompt = f"""
-You are an expert cover letter writer with years of experience helping candidates land jobs.
-
-Based on this resume and job description, write a compelling, professional cover letter.
-
-RESUME:
-{text[:3500]}
-
-JOB DESCRIPTION:
-{job_description if job_description else "General professional position"}
-
-COMPANY NAME: {company_name}
-HIRING MANAGER: {hiring_manager}
-
-RULES:
-1. Professional but warm and personable tone
-2. Strong opening that grabs attention
-3. Highlight 2-3 most relevant experiences/achievements from resume
-4. Show genuine enthusiasm for the role and company
-5. Include specific examples with metrics if available
-6. Strong closing with call to action
-7. Keep it concise - 3-4 paragraphs maximum
-8. Do NOT copy resume bullet points directly - reframe them
-9. Make it feel authentic, not generic
-
-FORMAT:
-- Start with "Dear {hiring_manager},"
-- End with "Sincerely," and leave space for name
-
-Return ONLY the cover letter text, no additional commentary.
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.5,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are an expert cover letter writer. Write compelling, personalized cover letters."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=1500,
-    )
-
-    cover_letter = completion.choices[0].message.content
-    print("✅ Cover letter generated")
-
-    return jsonify({
-        "success": True,
-        "coverLetter": cover_letter,
-    })
-
-
-def generate_cover_letter_vision(file_path, filename, job_description, company_name, hiring_manager):
-    """Generate cover letter from resume image."""
-    print("🔍 Generating cover letter from image...")
-
-    base64_image = image_to_base64(file_path)
-    mime_type = get_image_mime_type(filename)
-
-    prompt = f"""
-You are an expert cover letter writer.
-
-Look at this resume image and write a compelling, professional cover letter.
-
-JOB DESCRIPTION:
-{job_description if job_description else "General professional position"}
-
-COMPANY NAME: {company_name}
-HIRING MANAGER: {hiring_manager}
-
-RULES:
-1. Professional but warm tone
-2. Strong attention-grabbing opening
-3. Highlight 2-3 most relevant experiences from what you see
-4. Show enthusiasm for the role
-5. Include specific examples if visible
-6. Strong closing with call to action
-7. 3-4 paragraphs maximum
-8. Make it authentic, not generic
-
-FORMAT:
-- Start with "Dear {hiring_manager},"
-- End with "Sincerely," and leave space for name
-
-Return ONLY the cover letter text.
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.5,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
-        ],
-        max_tokens=1500,
-    )
-
-    cover_letter = completion.choices[0].message.content
-    print("✅ Cover letter generated from image")
-
-    return jsonify({
-        "success": True,
-        "coverLetter": cover_letter,
-    })
-
-
-# ===============================
-# LINKEDIN OPTIMIZER
-# ===============================
-@app.route("/optimize-linkedin", methods=["POST"])
-def optimize_linkedin():
-    file_path = None
-    try:
-        print("💼 LinkedIn optimization request received")
-
-        job_description = request.form.get("jobDescription", "")
-        target_role = request.form.get("targetRole", "")
-
-        if "resume" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
-
-        file = request.files["resume"]
-        file_path = save_uploaded_file(file)
-
-        ext = get_file_extension(file.filename)
-        is_image = ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-
-        # Get resume content
-        if ext == ".pdf":
-            text = extract_text_from_pdf(file_path)
-            if text.strip():
-                return optimize_linkedin_text(text, job_description, target_role)
-
-        if is_image or not text.strip():
-            try:
-                text = extract_text_from_image(file_path)
-                if text.strip() and len(text.strip()) > 100:
-                    return optimize_linkedin_text(text, job_description, target_role)
-            except:
-                pass
-
-            return optimize_linkedin_vision(
-                file_path, file.filename, job_description, target_role
-            )
-
-        return optimize_linkedin_text(text, job_description, target_role)
-
-    except Exception as e:
-        import traceback
-        print(f"❌ LinkedIn optimization error: {e}")
-        print(traceback.format_exc())
-        return jsonify({"error": "Failed to optimize LinkedIn"}), 500
-
-    finally:
-        if file_path:
-            cleanup_file(file_path)
-
-
-def optimize_linkedin_text(text, job_description, target_role):
-    """Optimize LinkedIn from resume text."""
-    print("📝 Optimizing LinkedIn from text...")
-
-    prompt = f"""
-You are a LinkedIn optimization expert who has helped thousands of professionals improve their profiles.
-
-Based on this resume, generate optimized LinkedIn profile content.
-
-RESUME:
-{text[:3500]}
-
-TARGET ROLE/INDUSTRY:
-{target_role if target_role else job_description if job_description else "General professional"}
-
-Generate the following LinkedIn content:
-
-1. HEADLINE (max 220 characters)
-   - Keyword-rich but readable
-   - Include value proposition
-   - Example format: "Role | Specialty | Value Prop" or "Helping X do Y through Z"
-
-2. ABOUT SECTION (max 2600 characters)
-   - Hook in first 2 lines (visible before "see more")
-   - Tell your professional story
-   - Highlight key achievements with metrics
-   - Include relevant keywords naturally
-   - End with call to action
-   - Use short paragraphs and line breaks
-
-3. EXPERIENCE BULLETS (for each role)
-   - Start with action verbs
-   - Include metrics and results
-   - Show impact, not just duties
-   - Keyword optimized
-
-4. FEATURED SKILLS (top 10)
-   - Most relevant to target role
-   - Mix of hard and soft skills
-   - Endorsable skills
-
-5. KEYWORDS TO ADD
-   - Industry-specific terms
-   - Tools and technologies
-   - Certifications if any
-
-6. PROFILE TIPS
-   - Specific suggestions to improve their profile
-
-Return STRICT JSON:
-
-{{
-  "headline": "Your optimized headline here",
-  "about": "Your optimized about section here...",
-  "experienceBullets": [
-    {{
-      "company": "Company Name",
-      "role": "Job Title", 
-      "bullets": ["Achievement 1", "Achievement 2", "Achievement 3"]
-    }}
-  ],
-  "featuredSkills": ["Skill 1", "Skill 2", "Skill 3", "Skill 4", "Skill 5"],
-  "keywords": ["keyword1", "keyword2", "keyword3"],
-  "profileTips": ["Tip 1", "Tip 2", "Tip 3"]
-}}
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.3,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a LinkedIn optimization expert. Return only valid JSON."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=2500,
-    )
-
-    raw = completion.choices[0].message.content
-    print(f"🤖 LinkedIn Response: {raw[:500]}")
-
-    parsed = extract_json_from_response(raw)
-    print("✅ LinkedIn optimization complete")
-
-    return jsonify({"success": True, **parsed})
-
-
-def optimize_linkedin_vision(file_path, filename, job_description, target_role):
-    """Optimize LinkedIn from resume image."""
-    print("🔍 Optimizing LinkedIn from image...")
-
-    base64_image = image_to_base64(file_path)
-    mime_type = get_image_mime_type(filename)
-
-    prompt = f"""
-You are a LinkedIn optimization expert.
-
-Look at this resume image and generate optimized LinkedIn profile content.
-
-TARGET ROLE/INDUSTRY:
-{target_role if target_role else job_description if job_description else "General professional"}
-
-Generate:
-
-1. HEADLINE (max 220 chars) - Keyword-rich, includes value proposition
-2. ABOUT SECTION - Hook, story, achievements, keywords, CTA
-3. EXPERIENCE BULLETS - Action verbs, metrics, impact
-4. FEATURED SKILLS - Top 10 relevant skills
-5. KEYWORDS - Industry-specific terms
-6. PROFILE TIPS - Specific improvement suggestions
-
-Return STRICT JSON:
-
-{{
-  "headline": "string",
-  "about": "string",
-  "experienceBullets": [
-    {{
-      "company": "Company Name",
-      "role": "Job Title",
-      "bullets": ["bullet1", "bullet2"]
-    }}
-  ],
-  "featuredSkills": ["skill1", "skill2"],
-  "keywords": ["keyword1", "keyword2"],
-  "profileTips": ["tip1", "tip2"]
-}}
-
-Return ONLY the JSON.
-"""
-
-    completion = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
-        temperature=0.3,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
-        ],
-        max_tokens=2500,
-    )
-
-    raw = completion.choices[0].message.content
-    parsed = extract_json_from_response(raw)
-    print("✅ LinkedIn optimization from image complete")
-
-    return jsonify({"success": True, **parsed})
-
-# ===============================
-# START SERVER
+# RUN SERVER
 # ===============================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
-    is_production = os.getenv("RENDER") is not None
 
-    if is_production:
-        print(f"🚀 Server running in PRODUCTION on port {port}")
-    else:
-        print(f"🚀 Server running on http://localhost:{port}")
+    # 🔥 Get local IP for mobile testing
+    import socket
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=not is_production,
-    )
+    print("\n" + "="*60)
+    print("🚀 SERVER STARTED")
+    print("="*60)
+    print(f"📍 Local:    http://localhost:{port}")
+    print(f"📍 Network:  http://{local_ip}:{port}")
+    print(f"📱 Mobile:   http://{local_ip}:{port}")
+    print("="*60)
+    print("\n🔥 Server is running. Use Network URL for mobile testing.\n")
+
+    # ✅ host="0.0.0.0" allows connections from other devices
+    app.run(host="0.0.0.0", port=port, debug=True)
