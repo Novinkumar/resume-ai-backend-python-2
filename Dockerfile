@@ -1,55 +1,26 @@
-# ===============================
-# Git
-# ===============================
-.git
-.gitignore
+FROM python:3.11-slim
 
-# ===============================
-# Python cache
-# ===============================
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+WORKDIR /app
 
-# ===============================
-# Virtual environments
-# ===============================
-env/
-venv/
-ENV/
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# ===============================
-# Environment variables (IMPORTANT)
-# ===============================
-.env
+COPY requirements.txt .
 
-# ===============================
-# Logs
-# ===============================
-*.log
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir -r requirements.txt
 
-# ===============================
-# OS files
-# ===============================
-.DS_Store
-Thumbs.db
+COPY . .
 
-# ===============================
-# IDE
-# ===============================
-.vscode/
-.idea/
+RUN mkdir -p uploads
 
-# ===============================
-# Unnecessary files
-# ===============================
-README.md
-*.md
+ENV PYTHONUNBUFFERED=1
+ENV PORT=10000
 
-# ===============================
-# Do NOT ignore these (IMPORTANT)
-# ===============================
-# Dockerfile ✅
-# requirements.txt ✅
-# app.py ✅
+EXPOSE 10000
+
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120 app:app
